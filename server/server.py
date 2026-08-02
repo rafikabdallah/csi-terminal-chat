@@ -1,6 +1,7 @@
 """CSI Terminal Chat - server.
 
-Thread-per-client TCP server with authentication, rooms, and private messages.
+Thread-per-client TCP server with authentication, rooms, private
+messages, and security event logging.
 """
 
 import socket
@@ -12,6 +13,7 @@ import re
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.protocol import send_msg, recv_msg, ProtocolError
+from logger import log
 import auth
 import db
 
@@ -60,6 +62,7 @@ def handle_register(sock, msg, addr):
     password = msg.get("password")
 
     if not valid_username(username):
+        log.warning(f"REGISTER rejected (bad username) ip={addr[0]}")
         send_msg(sock, {"type": "auth_error",
                         "reason": "Username must be 3-20 chars: letters, digits, underscore"})
         return None
@@ -72,11 +75,11 @@ def handle_register(sock, msg, addr):
     salt_hex, hash_hex = auth.hash_password(password)
 
     if not db.create_user(username, salt_hex, hash_hex):
-        print(f"[AUTH] Registration refused (taken): {username} from {addr[0]}")
+        log.warning(f"REGISTER refused (taken) user={username} ip={addr[0]}")
         send_msg(sock, {"type": "auth_error", "reason": "Username already taken"})
         return None
 
-    print(f"[AUTH] Registered: {username} from {addr[0]}")
+    log.info(f"REGISTER ok user={username} ip={addr[0]}")
     send_msg(sock, {"type": "auth_ok", "username": username})
     return None
 
@@ -86,25 +89,27 @@ def handle_login(sock, msg, addr):
     password = msg.get("password")
 
     if not valid_username(username) or not isinstance(password, str):
+        log.warning(f"LOGIN FAILED (malformed) ip={addr[0]}")
         send_msg(sock, {"type": "auth_error", "reason": "Invalid username or password"})
         return None
 
     row = db.get_user(username)
 
     if row is None or not auth.verify_password(password, row[0], row[1]):
-        print(f"[AUTH] FAILED login for '{username}' from {addr[0]}")
+        log.warning(f"LOGIN FAILED user={username} ip={addr[0]}")
         send_msg(sock, {"type": "auth_error", "reason": "Invalid username or password"})
         return None
 
     with clients_lock:
         if username in clients:
+            log.warning(f"LOGIN refused (already online) user={username} ip={addr[0]}")
             send_msg(sock, {"type": "auth_error", "reason": "User already connected"})
             return None
         clients[username] = sock
         rooms.setdefault(DEFAULT_ROOM, set()).add(username)
         user_rooms[username] = DEFAULT_ROOM
 
-    print(f"[AUTH] Login OK: {username} from {addr[0]}")
+    log.info(f"LOGIN ok user={username} ip={addr[0]}")
     send_msg(sock, {"type": "auth_ok", "username": username, "room": DEFAULT_ROOM})
     broadcast_room(DEFAULT_ROOM,
                    {"type": "system", "text": f"{username} joined #{DEFAULT_ROOM}"},
@@ -134,7 +139,7 @@ def handle_join(sock, username, msg):
         rooms.setdefault(room, set()).add(username)
         user_rooms[username] = room
 
-    print(f"[ROOM] {username}: {old_room} -> {room}")
+    log.info(f"ROOM user={username} from={old_room} to={room}")
 
     if old_room:
         broadcast_room(old_room, {"type": "system", "text": f"{username} left #{old_room}"})
@@ -183,7 +188,7 @@ def handle_private(sock, sender, msg):
         send_msg(sock, {"type": "error", "reason": f"{target} is not online"})
         return
 
-    print(f"[PM] {sender} -> {target}")
+    log.info(f"PM from={sender} to={target}")
 
     try:
         send_msg(target_sock, {"type": "private", "from": sender, "text": text})
@@ -194,7 +199,7 @@ def handle_private(sock, sender, msg):
 
 def handle_client(client_sock, addr):
     """One thread per connection."""
-    print(f"[SERVER] Connection from {addr[0]}:{addr[1]}")
+    log.info(f"CONNECT ip={addr[0]} port={addr[1]}")
     username = None
 
     try:
@@ -208,6 +213,7 @@ def handle_client(client_sock, addr):
                 elif mtype == "login":
                     username = handle_login(client_sock, msg, addr)
                 else:
+                    log.warning(f"UNAUTH action type={mtype} ip={addr[0]}")
                     send_msg(client_sock, {"type": "auth_error",
                                            "reason": "Please /login or /register first"})
                 continue
@@ -220,7 +226,7 @@ def handle_client(client_sock, addr):
                 with clients_lock:
                     room = user_rooms.get(username, DEFAULT_ROOM)
 
-                print(f"[CHAT] #{room} {username}: {text}")
+                log.info(f"CHAT room={room} user={username} len={len(text)}")
                 broadcast_room(room, {"type": "chat", "from": username,
                                       "room": room, "text": text},
                                exclude=username)
@@ -238,13 +244,14 @@ def handle_client(client_sock, addr):
                 handle_private(client_sock, username, msg)
 
             else:
+                log.warning(f"UNKNOWN type={mtype} user={username} ip={addr[0]}")
                 send_msg(client_sock, {"type": "error",
                                        "reason": f"Unknown message type: {mtype}"})
 
     except ProtocolError as e:
-        print(f"[SERVER] {addr[0]} disconnected: {e}")
+        log.info(f"DISCONNECT ip={addr[0]} user={username} reason={e}")
     except Exception as e:
-        print(f"[SERVER] {addr[0]} error: {e}")
+        log.error(f"HANDLER ERROR ip={addr[0]} user={username}: {e}")
     finally:
         room = None
         if username:
@@ -258,7 +265,7 @@ def handle_client(client_sock, addr):
 
             if room:
                 broadcast_room(room, {"type": "system", "text": f"{username} left the chat"})
-            print(f"[SERVER] {username} cleaned up")
+            log.info(f"CLEANUP user={username}")
 
         client_sock.close()
 
@@ -270,7 +277,7 @@ def main():
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind((HOST, PORT))
     server_sock.listen(5)
-    print(f"[SERVER] Listening on {HOST}:{PORT}")
+    log.info(f"Server listening on {HOST}:{PORT}")
 
     try:
         while True:
@@ -278,9 +285,10 @@ def main():
             threading.Thread(target=handle_client, args=(client_sock, addr),
                              daemon=True).start()
     except KeyboardInterrupt:
-        print("\n[SERVER] Shutting down.")
+        log.info("Shutdown requested")
     finally:
         server_sock.close()
+        log.info("Server stopped")
 
 
 if __name__ == "__main__":
