@@ -1,7 +1,7 @@
 """CSI Terminal Chat - server.
 
 Thread-per-client TCP server with authentication, rooms, private
-messages, and security event logging.
+messages, security event logging, and graceful shutdown.
 """
 
 import socket
@@ -9,26 +9,32 @@ import threading
 import sys
 import os
 import re
+import argparse
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.protocol import send_msg, recv_msg, ProtocolError
+from common import colors as C
 from logger import log
 import auth
 import db
 
-HOST = "0.0.0.0"
-PORT = 5000
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 5000
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 ROOM_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
 MAX_PASSWORD_LEN = 128
 DEFAULT_ROOM = "general"
+IDLE_TIMEOUT = 300
 
 clients = {}                      # username -> socket
 rooms = {DEFAULT_ROOM: set()}     # room name -> set of usernames
 user_rooms = {}                   # username -> room name
 clients_lock = threading.Lock()
+
+_shutting_down = threading.Event()
 
 
 def broadcast_room(room, message, exclude=None):
@@ -108,8 +114,9 @@ def handle_login(sock, msg, addr):
         clients[username] = sock
         rooms.setdefault(DEFAULT_ROOM, set()).add(username)
         user_rooms[username] = DEFAULT_ROOM
+        online = len(clients)
 
-    log.info(f"LOGIN ok user={username} ip={addr[0]}")
+    log.info(f"LOGIN ok user={username} ip={addr[0]} online={online}")
     send_msg(sock, {"type": "auth_ok", "username": username, "room": DEFAULT_ROOM})
     broadcast_room(DEFAULT_ROOM,
                    {"type": "system", "text": f"{username} joined #{DEFAULT_ROOM}"},
@@ -153,7 +160,7 @@ def handle_rooms(sock):
     with clients_lock:
         listing = {name: len(members) for name, members in rooms.items()}
 
-    lines = [f"  #{name} ({count})" for name, count in sorted(listing.items())]
+    lines = [f"  #{name} ({count} online)" for name, count in sorted(listing.items())]
     send_msg(sock, {"type": "system", "text": "Rooms:\n" + "\n".join(lines)})
 
 
@@ -162,7 +169,8 @@ def handle_who(sock, username):
         room = user_rooms.get(username, DEFAULT_ROOM)
         members = sorted(rooms.get(room, set()))
 
-    send_msg(sock, {"type": "system", "text": f"In #{room}: " + ", ".join(members)})
+    send_msg(sock, {"type": "system",
+                    "text": f"In #{room} ({len(members)}): " + ", ".join(members)})
 
 
 def handle_private(sock, sender, msg):
@@ -200,10 +208,12 @@ def handle_private(sock, sender, msg):
 def handle_client(client_sock, addr):
     """One thread per connection."""
     log.info(f"CONNECT ip={addr[0]} port={addr[1]}")
+    client_sock.settimeout(IDLE_TIMEOUT)
     username = None
+    room = None
 
     try:
-        while True:
+        while not _shutting_down.is_set():
             msg = recv_msg(client_sock)
             mtype = msg.get("type")
 
@@ -248,36 +258,100 @@ def handle_client(client_sock, addr):
                 send_msg(client_sock, {"type": "error",
                                        "reason": f"Unknown message type: {mtype}"})
 
+    except socket.timeout:
+        log.warning(f"TIMEOUT ip={addr[0]} user={username} after={IDLE_TIMEOUT}s")
     except ProtocolError as e:
         log.info(f"DISCONNECT ip={addr[0]} user={username} reason={e}")
     except Exception as e:
         log.error(f"HANDLER ERROR ip={addr[0]} user={username}: {e}")
     finally:
-        room = None
+        left_room = None
         if username:
             with clients_lock:
                 clients.pop(username, None)
-                room = user_rooms.pop(username, None)
-                if room and room in rooms:
-                    rooms[room].discard(username)
-                    if not rooms[room] and room != DEFAULT_ROOM:
-                        del rooms[room]
+                left_room = user_rooms.pop(username, None)
+                if left_room and left_room in rooms:
+                    rooms[left_room].discard(username)
+                    if not rooms[left_room] and left_room != DEFAULT_ROOM:
+                        del rooms[left_room]
+                online = len(clients)
 
-            if room:
-                broadcast_room(room, {"type": "system", "text": f"{username} left the chat"})
-            log.info(f"CLEANUP user={username}")
+            if left_room and not _shutting_down.is_set():
+                broadcast_room(left_room,
+                               {"type": "system", "text": f"{username} left the chat"})
+            log.info(f"CLEANUP user={username} online={online}")
 
-        client_sock.close()
+        try:
+            client_sock.close()
+        except Exception:
+            pass
+
+
+def shutdown(server_sock):
+    """Notify every connected client, then close all sockets."""
+    _shutting_down.set()
+
+    with clients_lock:
+        socks = list(clients.values())
+
+    if socks:
+        log.info(f"Notifying {len(socks)} client(s) of shutdown")
+
+    for sock in socks:
+        try:
+            send_msg(sock, {"type": "system", "text": "Server is shutting down"})
+            sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    try:
+        server_sock.close()
+    except Exception:
+        pass
+
+    log.info("Server stopped")
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="CSI Terminal Chat server")
+    p.add_argument("--host", default=DEFAULT_HOST,
+                   help=f"interface to bind (default {DEFAULT_HOST})")
+    p.add_argument("--port", type=int, default=DEFAULT_PORT,
+                   help=f"TCP port (default {DEFAULT_PORT})")
+    return p.parse_args()
 
 
 def main():
+    args = parse_args()
+
+    print(C.BANNER)
+    print(f"{C.GREY}  starting up{C.RESET}", end="", flush=True)
+    for _ in range(3):
+        time.sleep(0.15)
+        print(f"{C.GREY}.{C.RESET}", end="", flush=True)
+    print()
+
     db.init_db()
 
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_sock.bind((HOST, PORT))
+
+    try:
+        server_sock.bind((args.host, args.port))
+    except OSError as e:
+        print(f"{C.RED}  cannot bind {args.host}:{args.port} - {e}{C.RESET}")
+        return 1
+
     server_sock.listen(5)
-    log.info(f"Server listening on {HOST}:{PORT}")
+
+    print(f"{C.GREEN}  ● listening on {args.host}:{args.port}{C.RESET}")
+    print(f"{C.GREY}  Ctrl+C to stop{C.RESET}\n")
+    log.info(f"Server listening on {args.host}:{args.port}")
 
     try:
         while True:
@@ -285,11 +359,13 @@ def main():
             threading.Thread(target=handle_client, args=(client_sock, addr),
                              daemon=True).start()
     except KeyboardInterrupt:
+        print(f"\n{C.YELLOW}  shutdown requested{C.RESET}")
         log.info("Shutdown requested")
     finally:
-        server_sock.close()
-        log.info("Server stopped")
+        shutdown(server_sock)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
