@@ -1,6 +1,6 @@
 """CSI Terminal Chat - server.
 
-Thread-per-client TCP server with authentication.
+Thread-per-client TCP server with authentication and rooms.
 """
 
 import socket
@@ -19,18 +19,24 @@ HOST = "0.0.0.0"
 PORT = 5000
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
+ROOM_RE = re.compile(r"^[A-Za-z0-9_-]{1,20}$")
 MAX_PASSWORD_LEN = 128
+DEFAULT_ROOM = "general"
 
-clients = {}
+clients = {}                      # username -> socket
+rooms = {DEFAULT_ROOM: set()}     # room name -> set of usernames
+user_rooms = {}                   # username -> room name
 clients_lock = threading.Lock()
 
 
-def broadcast(message, exclude=None):
-    """Send a message to all authenticated clients except `exclude`."""
+def broadcast_room(room, message, exclude=None):
+    """Send a message to everyone in `room` except `exclude`."""
     with clients_lock:
-        targets = [(u, s) for u, s in clients.items() if u != exclude]
+        members = [(u, clients[u])
+                   for u in rooms.get(room, set())
+                   if u != exclude and u in clients]
 
-    for username, sock in targets:
+    for username, sock in members:
         try:
             send_msg(sock, message)
         except Exception:
@@ -39,6 +45,10 @@ def broadcast(message, exclude=None):
 
 def valid_username(name):
     return isinstance(name, str) and USERNAME_RE.match(name) is not None
+
+
+def valid_room(name):
+    return isinstance(name, str) and ROOM_RE.match(name) is not None
 
 
 def valid_password(pw):
@@ -68,7 +78,7 @@ def handle_register(sock, msg, addr):
 
     print(f"[AUTH] Registered: {username} from {addr[0]}")
     send_msg(sock, {"type": "auth_ok", "username": username})
-    return username
+    return None
 
 
 def handle_login(sock, msg, addr):
@@ -76,30 +86,79 @@ def handle_login(sock, msg, addr):
     password = msg.get("password")
 
     if not valid_username(username) or not isinstance(password, str):
-        send_msg(sock, {"type": "auth_error",
-                        "reason": "Invalid username or password"})
+        send_msg(sock, {"type": "auth_error", "reason": "Invalid username or password"})
         return None
 
     row = db.get_user(username)
 
     if row is None or not auth.verify_password(password, row[0], row[1]):
         print(f"[AUTH] FAILED login for '{username}' from {addr[0]}")
-        send_msg(sock, {"type": "auth_error",
-                        "reason": "Invalid username or password"})
+        send_msg(sock, {"type": "auth_error", "reason": "Invalid username or password"})
         return None
 
     with clients_lock:
         if username in clients:
-            send_msg(sock, {"type": "auth_error",
-                            "reason": "User already connected"})
+            send_msg(sock, {"type": "auth_error", "reason": "User already connected"})
             return None
         clients[username] = sock
+        rooms.setdefault(DEFAULT_ROOM, set()).add(username)
+        user_rooms[username] = DEFAULT_ROOM
 
     print(f"[AUTH] Login OK: {username} from {addr[0]}")
-    send_msg(sock, {"type": "auth_ok", "username": username})
-    broadcast({"type": "system", "text": f"{username} joined the chat"},
-              exclude=username)
+    send_msg(sock, {"type": "auth_ok", "username": username, "room": DEFAULT_ROOM})
+    broadcast_room(DEFAULT_ROOM,
+                   {"type": "system", "text": f"{username} joined #{DEFAULT_ROOM}"},
+                   exclude=username)
     return username
+
+
+def handle_join(sock, username, msg):
+    room = msg.get("room")
+
+    if not valid_room(room):
+        send_msg(sock, {"type": "error",
+                        "reason": "Room name must be 1-20 chars: letters, digits, _ or -"})
+        return
+
+    with clients_lock:
+        old_room = user_rooms.get(username)
+        if old_room == room:
+            send_msg(sock, {"type": "error", "reason": f"Already in #{room}"})
+            return
+
+        if old_room and old_room in rooms:
+            rooms[old_room].discard(username)
+            if not rooms[old_room] and old_room != DEFAULT_ROOM:
+                del rooms[old_room]
+
+        rooms.setdefault(room, set()).add(username)
+        user_rooms[username] = room
+
+    print(f"[ROOM] {username}: {old_room} -> {room}")
+
+    if old_room:
+        broadcast_room(old_room, {"type": "system", "text": f"{username} left #{old_room}"})
+
+    send_msg(sock, {"type": "system", "text": f"You joined #{room}"})
+    broadcast_room(room, {"type": "system", "text": f"{username} joined #{room}"},
+                   exclude=username)
+
+
+def handle_rooms(sock):
+    with clients_lock:
+        listing = {name: len(members) for name, members in rooms.items()}
+
+    lines = [f"  #{name} ({count})" for name, count in sorted(listing.items())]
+    send_msg(sock, {"type": "system", "text": "Rooms:\n" + "\n".join(lines)})
+
+
+def handle_who(sock, username):
+    with clients_lock:
+        room = user_rooms.get(username, DEFAULT_ROOM)
+        members = sorted(rooms.get(room, set()))
+
+    send_msg(sock, {"type": "system",
+                    "text": f"In #{room}: " + ", ".join(members)})
 
 
 def handle_client(client_sock, addr):
@@ -126,9 +185,24 @@ def handle_client(client_sock, addr):
                 text = msg.get("text", "")
                 if not isinstance(text, str) or not text.strip():
                     continue
-                print(f"[CHAT] {username}: {text}")
-                broadcast({"type": "chat", "from": username, "text": text},
-                          exclude=username)
+
+                with clients_lock:
+                    room = user_rooms.get(username, DEFAULT_ROOM)
+
+                print(f"[CHAT] #{room} {username}: {text}")
+                broadcast_room(room, {"type": "chat", "from": username,
+                                      "room": room, "text": text},
+                               exclude=username)
+
+            elif mtype == "join":
+                handle_join(client_sock, username, msg)
+
+            elif mtype == "rooms":
+                handle_rooms(client_sock)
+
+            elif mtype == "who":
+                handle_who(client_sock, username)
+
             else:
                 send_msg(client_sock, {"type": "error",
                                        "reason": f"Unknown message type: {mtype}"})
@@ -141,8 +215,16 @@ def handle_client(client_sock, addr):
         if username:
             with clients_lock:
                 clients.pop(username, None)
-            broadcast({"type": "system", "text": f"{username} left the chat"})
+                room = user_rooms.pop(username, None)
+                if room and room in rooms:
+                    rooms[room].discard(username)
+                    if not rooms[room] and room != DEFAULT_ROOM:
+                        del rooms[room]
+
+            if room:
+                broadcast_room(room, {"type": "system", "text": f"{username} left the chat"})
             print(f"[SERVER] {username} cleaned up")
+
         client_sock.close()
 
 
@@ -158,8 +240,7 @@ def main():
     try:
         while True:
             client_sock, addr = server_sock.accept()
-            threading.Thread(target=handle_client,
-                             args=(client_sock, addr),
+            threading.Thread(target=handle_client, args=(client_sock, addr),
                              daemon=True).start()
     except KeyboardInterrupt:
         print("\n[SERVER] Shutting down.")

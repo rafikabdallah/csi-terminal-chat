@@ -17,12 +17,11 @@ HOST = "192.168.119.50"
 PORT = 5000
 
 running = True
-authenticated = False
 
 
 def receive_loop(sock):
     """Print everything the server sends."""
-    global running, authenticated
+    global running
 
     try:
         while running:
@@ -30,16 +29,19 @@ def receive_loop(sock):
             mtype = msg.get("type")
 
             if mtype == "chat":
-                print(f"\r[{msg.get('from')}] {msg.get('text')}\n> ", end="")
+                print(f"\r[#{msg.get('room')}] {msg.get('from')}: {msg.get('text')}\n> ", end="")
             elif mtype == "system":
                 print(f"\r*** {msg.get('text')}\n> ", end="")
             elif mtype == "auth_ok":
-                authenticated = True
-                print(f"\r*** Logged in as {msg.get('username')}\n> ", end="")
-            elif mtype == "auth_error":
+                room = msg.get("room")
+                if room:
+                    print(f"\r*** Logged in as {msg.get('username')} in #{room}\n> ", end="")
+                else:
+                    print(f"\r*** Account created. Now use /login\n> ", end="")
+            elif mtype in ("auth_error", "error"):
                 print(f"\r!!! {msg.get('reason')}\n> ", end="")
             else:
-                print(f"\r!!! {msg.get('reason', msg)}\n> ", end="")
+                print(f"\r??? {msg}\n> ", end="")
 
     except ProtocolError:
         print("\r*** Connection to server lost.")
@@ -51,10 +53,14 @@ def receive_loop(sock):
 
 def print_help():
     print("Commands:")
-    print("  /register <username>   - create an account")
-    print("  /login <username>      - log in")
-    print("  /quit                  - disconnect")
-    print("  anything else          - send as chat")
+    print("  /register <username>  - create an account")
+    print("  /login <username>     - log in")
+    print("  /join <room>          - switch room")
+    print("  /rooms                - list rooms")
+    print("  /who                  - who is in your room")
+    print("  /help                 - this list")
+    print("  /quit                 - disconnect")
+    print("  anything else         - send as chat")
 
 
 def main():
@@ -87,18 +93,28 @@ def main():
                 print_help()
                 continue
 
+            if line == "/rooms":
+                send_msg(sock, {"type": "rooms"})
+                continue
+
+            if line == "/who":
+                send_msg(sock, {"type": "who"})
+                continue
+
+            if line.startswith("/join "):
+                room = line.split(maxsplit=1)[1].strip()
+                send_msg(sock, {"type": "join", "room": room})
+                continue
+
             if line.startswith("/register ") or line.startswith("/login "):
                 parts = line.split(maxsplit=1)
                 command = parts[0][1:]
                 username = parts[1].strip()
-
                 password = getpass.getpass("Password: ")
 
-                send_msg(sock, {
-                    "type": command,
-                    "username": username,
-                    "password": password
-                })
+                send_msg(sock, {"type": command,
+                                "username": username,
+                                "password": password})
                 continue
 
             if line.startswith("/"):
