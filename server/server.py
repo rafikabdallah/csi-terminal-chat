@@ -1,6 +1,6 @@
 """CSI Terminal Chat - server.
 
-Thread-per-client TCP server with authentication and rooms.
+Thread-per-client TCP server with authentication, rooms, and private messages.
 """
 
 import socket
@@ -157,8 +157,39 @@ def handle_who(sock, username):
         room = user_rooms.get(username, DEFAULT_ROOM)
         members = sorted(rooms.get(room, set()))
 
-    send_msg(sock, {"type": "system",
-                    "text": f"In #{room}: " + ", ".join(members)})
+    send_msg(sock, {"type": "system", "text": f"In #{room}: " + ", ".join(members)})
+
+
+def handle_private(sock, sender, msg):
+    """Deliver a direct message to one online user."""
+    target = msg.get("to")
+    text = msg.get("text", "")
+
+    if not valid_username(target):
+        send_msg(sock, {"type": "error", "reason": "Invalid username"})
+        return
+
+    if not isinstance(text, str) or not text.strip():
+        return
+
+    if target == sender:
+        send_msg(sock, {"type": "error", "reason": "You cannot message yourself"})
+        return
+
+    with clients_lock:
+        target_sock = clients.get(target)
+
+    if target_sock is None:
+        send_msg(sock, {"type": "error", "reason": f"{target} is not online"})
+        return
+
+    print(f"[PM] {sender} -> {target}")
+
+    try:
+        send_msg(target_sock, {"type": "private", "from": sender, "text": text})
+        send_msg(sock, {"type": "private_sent", "to": target, "text": text})
+    except Exception:
+        send_msg(sock, {"type": "error", "reason": f"Could not deliver to {target}"})
 
 
 def handle_client(client_sock, addr):
@@ -203,6 +234,9 @@ def handle_client(client_sock, addr):
             elif mtype == "who":
                 handle_who(client_sock, username)
 
+            elif mtype == "private":
+                handle_private(client_sock, username, msg)
+
             else:
                 send_msg(client_sock, {"type": "error",
                                        "reason": f"Unknown message type: {mtype}"})
@@ -212,6 +246,7 @@ def handle_client(client_sock, addr):
     except Exception as e:
         print(f"[SERVER] {addr[0]} error: {e}")
     finally:
+        room = None
         if username:
             with clients_lock:
                 clients.pop(username, None)

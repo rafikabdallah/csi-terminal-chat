@@ -30,6 +30,10 @@ def receive_loop(sock):
 
             if mtype == "chat":
                 print(f"\r[#{msg.get('room')}] {msg.get('from')}: {msg.get('text')}\n> ", end="")
+            elif mtype == "private":
+                print(f"\r[PM from {msg.get('from')}] {msg.get('text')}\n> ", end="")
+            elif mtype == "private_sent":
+                print(f"\r[PM to {msg.get('to')}] {msg.get('text')}\n> ", end="")
             elif mtype == "system":
                 print(f"\r*** {msg.get('text')}\n> ", end="")
             elif mtype == "auth_ok":
@@ -53,14 +57,15 @@ def receive_loop(sock):
 
 def print_help():
     print("Commands:")
-    print("  /register <username>  - create an account")
-    print("  /login <username>     - log in")
-    print("  /join <room>          - switch room")
-    print("  /rooms                - list rooms")
-    print("  /who                  - who is in your room")
-    print("  /help                 - this list")
-    print("  /quit                 - disconnect")
-    print("  anything else         - send as chat")
+    print("  /register <username>   - create an account")
+    print("  /login <username>      - log in")
+    print("  /join <room>           - switch room")
+    print("  /rooms                 - list rooms")
+    print("  /who                   - who is in your room")
+    print("  /msg <user> <text>     - private message")
+    print("  /help                  - this list")
+    print("  /quit                  - disconnect")
+    print("  anything else          - send as chat")
 
 
 def main():
@@ -104,6 +109,14 @@ def main():
             if line.startswith("/join "):
                 room = line.split(maxsplit=1)[1].strip()
                 send_msg(sock, {"type": "join", "room": room})
+                continue
+
+            if line.startswith("/msg "):
+                parts = line.split(maxsplit=2)
+                if len(parts) < 3:
+                    print("!!! Usage: /msg <user> <message>")
+                    continue
+                send_msg(sock, {"type": "private", "to": parts[1], "text": parts[2]})
                 continue
 
             if line.startswith("/register ") or line.startswith("/login "):
